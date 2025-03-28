@@ -3,7 +3,7 @@
 
 # 【强化学习】07.近端策略优化(PPO) 算法原理
 
-- 论文：https://arxiv.org/abs/1707.06347
+- 论文：https://arxiv.org/abs/1707.06347  (2017.07.20  OpenAI)
 - 复现代码： https://github.com/songxia928/RL/blob/main/PPO.py
 
 

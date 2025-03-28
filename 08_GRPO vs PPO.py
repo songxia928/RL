@@ -3,25 +3,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Categorical
+from torch.distributions import Categorical, kl_divergence
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import rl_utils  # 导入用户提供的PPO工具
+import rl_utils  # 保留用户原有的PPO工具
 import PPO
 
-
-
-
 # ===========================
-# 0. 统一配置与工具（终极修复）
+# 0. 统一配置与工具
 # ===========================
 class Config:
-    ENV_NAME = 'CartPole-v1'  # 也可以换成其他环境
-    NUM_EPISODES = 500
+    ENV_NAME = 'CartPole-v1'
+    NUM_EPISODES = 1000
     HIDDEN_DIM = 128
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    SEED = 0  # 可复现性种子
+    SEED = 0
 
     # PPO专属配置
     PPO_CFG = {
@@ -38,23 +35,20 @@ class Config:
         'lr': 3e-4,
         'eps': 0.2,
         'beta': 0.01,
-        'group_size': 16,
         'gamma': 0.99,
     }
 
 def set_seed(seed):
-    """适配gym 0.26+的种子设置"""
     torch.manual_seed(seed)
     np.random.seed(seed)
-    # 移除所有gym全局种子设置，改为环境独立设置
 
 # ===========================
-# 1. PPO训练函数（修复种子设置）
+# 1. PPO训练函数
 # ===========================
 def train_ppo():
     set_seed(Config.SEED)
-    env = gym.make(Config.ENV_NAME)  # 创建环境
-    env.reset(seed=Config.SEED)  # 直接设置环境种子
+    env = gym.make(Config.ENV_NAME)
+    env.reset(seed=Config.SEED)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
@@ -78,59 +72,61 @@ def train_ppo():
     )
 
 # ===========================
-# 2. GRPO训练函数（修复种子设置）
+# 2. GRPO训练函数
 # ===========================
-def train_grpo():
-    set_seed(Config.SEED)
-    env = gym.make(Config.ENV_NAME)
-    env.reset(seed=Config.SEED)  # 环境级种子设置
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
+class GRPO:
+    def __init__(self, state_dim, action_dim, hidden_dim=128, **kwargs):
+        self.device = kwargs['device']
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+            nn.Softmax(dim=-1)
+        ).to(self.device)
+        self.optimizer = optim.Adam(self.actor.parameters(), lr=kwargs['lr'])
+        self.eps = kwargs['eps']
+        self.beta = kwargs['beta']
+        self.gamma = kwargs['gamma']
 
-    config = {
-        'hidden_dim': Config.HIDDEN_DIM,
-        'lr': Config.GRPO_CFG['lr'],
-        'eps': Config.GRPO_CFG['eps'],
-        'beta': Config.GRPO_CFG['beta'],
-        'gamma': Config.GRPO_CFG['gamma'],
-        'group_size': Config.GRPO_CFG['group_size'],
-        'device': Config.DEVICE
-    }
+    def sample(self, state):
+        state = torch.tensor([state], dtype=torch.float, device=self.device)
+        probs = self.actor(state)
+        dist = Categorical(probs)
+        action = dist.sample()
+        return action.cpu().numpy()[0], probs.detach().cpu().numpy()[0]
 
-    agent = GRPO(state_dim, action_dim, **config)
-    buffer = GRPOEpisodeBuffer()
-    returns = []
+    def update(self, transitions, discounted_rewards):
+        states = torch.tensor(transitions['states'], dtype=torch.float, device=self.device)
+        old_probs = torch.tensor(transitions['old_probs'], dtype=torch.float, device=self.device)
+        actions = torch.tensor(transitions['actions'], dtype=torch.long, device=self.device).view(-1, 1)
+        A = torch.tensor(discounted_rewards, dtype=torch.float, device=self.device).view(-1, 1)
 
-    for episode in tqdm(range(1, Config.NUM_EPISODES+1), desc='GRPO Training'):
-        state, _ = env.reset()  # 新版gym返回(state, info)
-        episode_return = 0
-        buffer.clear()
-        done = False
+        new_probs = self.actor(states).gather(1, actions)
+        ratio = torch.exp(torch.log(new_probs) - torch.log(old_probs.gather(1, actions)))
 
-        while not done:
-            actions, probs = agent.sample_group(state)
-            for a, p in zip(actions, probs):
-                next_state, reward, terminated, truncated, _ = env.step(a)
-                done = terminated or truncated
-                buffer.add(state, a, p.cpu().numpy(), reward)
-                episode_return += reward
-            state = next_state
+        surr1 = ratio * A
+        surr2 = torch.clamp(ratio, 1-self.eps, 1+self.eps) * A
+        clip_loss = -torch.mean(torch.min(surr1, surr2))
 
-        transitions = buffer.to_dict()
-        try:
-            agent.update(transitions)
-        except AssertionError:
-            continue
+        old_dist = Categorical(old_probs)
+        new_dist = Categorical(self.actor(states))
+        kl_div = kl_divergence(old_dist, new_dist)
+        kl_loss = torch.mean(kl_div)
 
-        returns.append(episode_return)
+        total_loss = clip_loss + self.beta * kl_loss
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
 
-    env.close()
-    return returns
+        return {
+            'clip_loss': clip_loss.item(),
+            'kl_loss': kl_loss.item(),
+            'total_loss': total_loss.item()
+        }
 
-# ===========================
-# 3. GRPO辅助类（保持不变）
-# ===========================
-class GRPOEpisodeBuffer:
+class EpisodeBuffer:
     def __init__(self):
         self.states = []
         self.actions = []
@@ -157,61 +153,58 @@ class GRPOEpisodeBuffer:
             'rewards': np.array(self.rewards)
         }
 
-class GRPO:
-    def __init__(self, state_dim, action_dim, hidden_dim=128, **kwargs):
-        self.device = kwargs['device']
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Softmax(dim=-1)
-        ).to(self.device)
-        self.optimizer = optim.Adam(self.actor.parameters(), lr=kwargs['lr'])
-        self.eps = kwargs['eps']
-        self.beta = kwargs['beta']
-        self.group_size = kwargs['group_size']
-        self.gamma = kwargs['gamma']
+def train_grpo():
+    set_seed(Config.SEED)
+    env = gym.make(Config.ENV_NAME)
+    env.reset(seed=Config.SEED)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
 
-    def sample_group(self, state, group_size=None):
-        group_size = group_size or self.group_size
-        state = torch.tensor([state]*group_size, dtype=torch.float, device=self.device)
-        probs = self.actor(state)
-        return Categorical(probs).sample().cpu().numpy(), probs.detach()
+    config = {
+        'hidden_dim': Config.HIDDEN_DIM,
+        'lr': Config.GRPO_CFG['lr'],
+        'eps': Config.GRPO_CFG['eps'],
+        'beta': Config.GRPO_CFG['beta'],
+        'gamma': Config.GRPO_CFG['gamma'],
+        'device': Config.DEVICE
+    }
 
-    def update(self, transitions):
-        states = torch.tensor(transitions['states'], dtype=torch.float, device=self.device)
-        old_probs = torch.tensor(transitions['old_probs'], dtype=torch.float, device=self.device)
-        actions = torch.tensor(transitions['actions'], dtype=torch.long, device=self.device).view(-1, 1)
-        rewards = torch.tensor(transitions['rewards'], dtype=torch.float, device=self.device).view(-1, 1)
+    agent = GRPO(state_dim, action_dim, **config)
+    buffer = EpisodeBuffer()
+    returns = []
 
-        assert rewards.shape[0] % self.group_size == 0, \
-            f"Reward count ({rewards.shape[0]}) not multiple of group_size ({self.group_size})"
+    for episode in tqdm(range(1, Config.NUM_EPISODES+1), desc='GRPO Training'):
+        state, _ = env.reset()
+        episode_return = 0
+        buffer.clear()
+        done = False
 
-        group_rewards = rewards.view(-1, self.group_size)
-        mu = group_rewards.mean(dim=1, keepdim=True)
-        std = group_rewards.std(dim=1, keepdim=True) + 1e-8
-        advantage = (group_rewards - mu) / std
-        advantage = advantage.view(-1, 1)
+        while not done:
+            action, old_prob = agent.sample(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
 
-        new_probs = self.actor(states).gather(1, actions)
-        ratio = torch.exp(torch.log(new_probs) - torch.log(old_probs.gather(1, actions)))
-        
-        surr1 = ratio * advantage
-        surr2 = torch.clamp(ratio, 1-self.eps, 1+self.eps) * advantage
-        clip_loss = -torch.mean(torch.min(surr1, surr2))
+            buffer.add(state, action, old_prob, reward)
+            state = next_state
+            episode_return += reward
 
-        kl_div = torch.sum(old_probs * (torch.log(old_probs) - torch.log(new_probs)), dim=1)
-        kl_loss = torch.mean(kl_div)
+        rewards = buffer.rewards
+        discounted_rewards = []
+        running_reward = 0
+        for r in reversed(rewards):
+            running_reward = r + agent.gamma * running_reward
+            discounted_rewards.insert(0, running_reward)
+        discounted_rewards = (discounted_rewards - np.mean(discounted_rewards)) / (np.std(discounted_rewards) + 1e-8)
 
-        total_loss = clip_loss + self.beta * kl_loss
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
+        transitions = buffer.to_dict()
+        agent.update(transitions, discounted_rewards)
+        returns.append(episode_return)
+
+    env.close()
+    return returns
 
 # ===========================
-# 4. 对比实验主流程（保持不变）
+# 3. 对比实验主流程
 # ===========================
 if __name__ == '__main__':
     ppo_returns = train_ppo()
