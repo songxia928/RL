@@ -1,7 +1,7 @@
 
 
 
-#  此代码为 基于pytorch实现的 Actor-Critic 代码实现，游戏实例包选择 gym。
+#  此代码为 基于pytorch实现的 PPO 代码实现，游戏实例包选择 gym。
 #  具体原理和细节，请参考博客：https://blog.csdn.net/songxia928_928/article/details/145266345
 
 import gym
