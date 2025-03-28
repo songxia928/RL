@@ -19,8 +19,6 @@ class ReplayBuffer:
     def size(self): 
         return len(self.buffer)
 
-
-'''
 def moving_average(a, window_size):
     cumulative_sum = np.cumsum(np.insert(a, 0, 0)) 
     middle = (cumulative_sum[window_size:] - cumulative_sum[:-window_size]) / window_size
@@ -28,17 +26,6 @@ def moving_average(a, window_size):
     begin = np.cumsum(a[:window_size-1])[::2] / r
     end = (np.cumsum(a[:-window_size:-1])[::2] / r)[::-1]
     return np.concatenate((begin, middle, end))
-'''
-
-
-def moving_average(a, window_size):
-    """
-    计算移动平均值
-    :param a: 输入数组
-    :param window_size: 窗口大小
-    :return: 移动平均后的数组
-    """
-    return np.convolve(a, np.ones(window_size), 'valid') / window_size
 
 def train_on_policy_agent(env, agent, num_episodes):
     return_list = []
@@ -103,3 +90,4 @@ def compute_advantage(gamma, lmbda, td_delta):
         advantage_list.append(advantage)
     advantage_list.reverse()
     return torch.tensor(advantage_list, dtype=torch.float)
+                
